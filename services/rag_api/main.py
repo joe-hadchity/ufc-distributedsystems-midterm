@@ -1,21 +1,44 @@
 import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from typing import List
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+from dotenv import load_dotenv
 
-try:
-    from openai import AzureOpenAI
-except Exception:  # pragma: no cover
-    AzureOpenAI = None  # type: ignore
+# ================================================
+# Rate limiting
+# ================================================
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
+# ================================================
+# Load environment
+# ================================================
 load_dotenv()
 
-app = FastAPI(title="UFC RAG API")
+# Initialize limiter
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[f"{os.getenv('API_RATE_LIMIT', '60')}/minute"]
+)
+
+# ================================================
+# Initialize FastAPI app
+# ================================================
+app = FastAPI(title="UFC RAG API", version="1.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ================================================
+# Azure OpenAI (optional)
+# ================================================
+try:
+    from openai import AzureOpenAI
+except Exception:
+    AzureOpenAI = None  # type: ignore
 
 
 class QARequest(BaseModel):
@@ -25,15 +48,15 @@ class QARequest(BaseModel):
 
 @app.on_event("startup")
 def startup_event():
-    app.state.qdrant = None
+    """Initialize external connections on startup."""
+    # ---------------- Qdrant ----------------
     try:
         app.state.qdrant = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
     except Exception:
         app.state.qdrant = None
 
-    if AzureOpenAI is None:
-        app.state.azure = None
-    else:
+    # ---------------- Azure OpenAI ----------------
+    if AzureOpenAI is not None:
         try:
             app.state.azure = AzureOpenAI(
                 api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -42,7 +65,10 @@ def startup_event():
             )
         except Exception:
             app.state.azure = None
+    else:
+        app.state.azure = None
 
+    # ---------------- MongoDB ----------------
     mongo_uri = os.getenv("MONGODB_URI")
     if not mongo_uri:
         raise RuntimeError("MONGODB_URI is required")
@@ -53,19 +79,33 @@ def startup_event():
 
 @app.on_event("shutdown")
 def shutdown_event():
+    """Close connections cleanly."""
     try:
         app.state.mongo.close()
     except Exception:
         pass
 
 
+# ================================================
+# Health Endpoint
+# ================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "qdrant": app.state.qdrant is not None, "azure": app.state.azure is not None}
+    """Quick check for service health and dependencies."""
+    return {
+        "status": "ok",
+        "qdrant": app.state.qdrant is not None,
+        "azure": app.state.azure is not None
+    }
 
 
+# ================================================
+# Fighters Endpoints
+# ================================================
 @app.get("/fighters")
-def list_fighters(limit: int = 20, skip: int = 0):
+@limiter.limit("60/minute")
+def list_fighters(request: Request, limit: int = 20, skip: int = 0):
+    """Return list of fighters (raw scraped data)."""
     try:
         cur = app.state.db["fighters"].find({}, {"_id": 0}).skip(skip).limit(limit)
         return list(cur)
@@ -74,7 +114,9 @@ def list_fighters(limit: int = 20, skip: int = 0):
 
 
 @app.get("/fighters/by_url")
-def get_fighter_by_url(url: str):
+@limiter.limit("60/minute")
+def get_fighter_by_url(request: Request, url: str):
+    """Fetch a fighter document by its UFC URL."""
     try:
         doc = app.state.db["fighters"].find_one({"url": url}, {"_id": 0})
         if not doc:
@@ -84,10 +126,15 @@ def get_fighter_by_url(url: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ================================================
+# Search Endpoint
+# ================================================
 @app.get("/search")
-def search(q: str = Query(...), k: int = Query(5)):
-    # Prefer vector search if available
-    if app.state.azure is not None and app.state.qdrant is not None:
+@limiter.limit("60/minute")
+def search(request: Request, q: str = Query(...), k: int = Query(5)):
+    """Search indexed fighter content (vector + text fallback)."""
+    # Prefer vector search
+    if app.state.azure and app.state.qdrant:
         collection = os.getenv("QDRANT_COLLECTION", "fighter_chunks")
         emb_model = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")
         emb = app.state.azure.embeddings.create(input=[q], model=emb_model).data[0].embedding
@@ -102,7 +149,7 @@ def search(q: str = Query(...), k: int = Query(5)):
             for r in results
         ]
 
-    # Fallback 1: Mongo text index search
+    # Mongo text index fallback
     try:
         cur = app.state.db["clean_docs"].find(
             {"$text": {"$search": q}},
@@ -111,27 +158,32 @@ def search(q: str = Query(...), k: int = Query(5)):
         out = list(cur)
         if out:
             return [
-                {"score": d.get("score"), "url": d.get("url"), "text": (d.get("text", "")[:500])}
+                {"score": d.get("score"), "url": d.get("url"), "text": d.get("text", "")[:500]}
                 for d in out
             ]
     except PyMongoError:
         pass
 
-    # Fallback 2: simple regex if text index not available
+    # Regex fallback
     try:
-        cur = app.state.db["clean_docs"].find({"text": {"$regex": q, "$options": "i"}}, {"_id": 0, "url": 1, "text": 1}).limit(k)
-        out = []
-        for d in cur:
-            out.append({"score": None, "url": d.get("url"), "text": d.get("text", "")[:500]})
-        return out
+        cur = app.state.db["clean_docs"].find(
+            {"text": {"$regex": q, "$options": "i"}},
+            {"_id": 0, "url": 1, "text": 1}
+        ).limit(k)
+        return [{"score": None, "url": d.get("url"), "text": d.get("text", "")[:500]} for d in cur]
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ================================================
+# QA Endpoint (RAG)
+# ================================================
 @app.post("/qa")
-def qa(body: QARequest):
+@limiter.limit("60/minute")
+def qa(request: Request, body: QARequest):
+    """Answer questions using RAG (retrieval-augmented generation)."""
     # Prefer vector + LLM if available
-    if app.state.azure is not None and app.state.qdrant is not None:
+    if app.state.azure and app.state.qdrant:
         collection = os.getenv("QDRANT_COLLECTION", "fighter_chunks")
         emb_model = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")
         chat_model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "o4-mini")
@@ -160,14 +212,19 @@ def qa(body: QARequest):
             "citations": [{"url": r.payload.get("url"), "score": r.score} for r in results],
         }
 
-    # Fallback: return top-k $text matches as context without LLM
-    cur = app.state.db["clean_docs"].find(
-        {"$text": {"$search": body.q}},
-        {"_id": 0, "url": 1, "text": 1, "score": {"$meta": "textScore"}},
-    ).sort([("score", {"$meta": "textScore"})]).limit(body.k)
-    docs = list(cur)
+    # Mongo-only fallback
+    try:
+        cur = app.state.db["clean_docs"].find(
+            {"$text": {"$search": body.q}},
+            {"_id": 0, "url": 1, "text": 1, "score": {"$meta": "textScore"}},
+        ).sort([("score", {"$meta": "textScore"})]).limit(body.k)
+        docs = list(cur)
+    except PyMongoError:
+        docs = []
+
     if not docs:
         return {"answer": "I don't know.", "citations": []}
+
     snippets = [d["text"][:300] for d in docs]
     return {
         "answer": "\n\n".join(snippets),

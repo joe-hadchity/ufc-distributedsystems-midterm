@@ -1,0 +1,6 @@
+@'
+confluent-kafka==2.5.0
+requests
+beautifulsoup4
+lxml
+'@ | Set-Content requirements.txt

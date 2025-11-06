@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scraper-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scraper
+  template:
+    metadata:
+      labels:
+        app: scraper
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: scraper
+        image: scraper:latest
+        imagePullPolicy: Never      # use the local image
+        args: ["python", "scraper_consumer.py"]
+        livenessProbe:
+          exec:
+            command: ["python", "healthcheck.py"]
+          initialDelaySeconds: 15
+          periodSeconds: 10
