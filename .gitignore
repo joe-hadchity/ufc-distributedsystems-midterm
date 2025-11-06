@@ -1,18 +1,27 @@
-# env
-.env
-*.env
-
-# python
+# Python
 __pycache__/
 *.pyc
-.venv/
+*.pyo
+
+# Virtual environments
 venv/
-.envrc
+venv312/
 
-# node
-node_modules/
+# VS Code
+.vscode/
 
-# docker
-docker-data/
+# OS files
+.DS_Store
+Thumbs.db
 
+# Env files
+.env
+.env.example
 
+# Data / outputs
+outputs/
+*.jsonl
+*.json
+
+# Docker + K8s temp
+*.log
