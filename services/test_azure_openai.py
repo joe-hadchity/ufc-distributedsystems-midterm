@@ -4,7 +4,7 @@ import os
 # Azure OpenAI configuration
 endpoint = "https://demoopenai2025.openai.azure.com/"
 deployment = "o4-mini"
-api_key = "DKr38bPvT6qXjERUl1yZFVUNFtuSnUmQzk8DzmhhchOTtCvTexhWJQQJ99BIACYeBjFXJ3w3AAABACOG949i"
+api_key = "sk-your-real-key-here"
 
 url = f"{endpoint}openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
 headers = {
